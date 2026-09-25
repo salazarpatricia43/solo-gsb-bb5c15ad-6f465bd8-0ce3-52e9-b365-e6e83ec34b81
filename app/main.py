@@ -39,6 +39,11 @@
 - 成员窗口因迟到事件发生修正后，已生成的组汇总原位重算且 revision 加一；
 - 修正以成员窗口 correction_count 之和为签名：同一 event_id 重试是幂等去重，
   不会产生新修正，签名不变，revision 不重复升版。
+- 写入路径的组对账为增量口径：每次 ingest 只对账本批实际新增或迟到修正触及的窗口，
+  以及水位线推进而刚封存的窗口；同组同窗只处理一次，其余无变化的历史窗口不读取、
+  不参与本次写入对账（历史增长后单个新事件或幂等重试不再全量重扫旧窗口）。
+  纯重复批次（全部事件去重跳过、水位线未变）不产生任何组窗口读写。
+  组创建时保留全量初始化：遍历成员全部历史窗口一次性补算 pending/ready。
 
 组窗口修订审计（append-only 快照）：
 - 组窗口首次 ready、以及迟到修正令 revision 升版时，在**同一事务**追加一份不可变快照，
@@ -789,12 +794,23 @@ def group_member_ids(conn: sqlite3.Connection, group_id: str) -> list[str]:
     return [r["device_id"] for r in rows]
 
 
-def reconcile_group(conn: sqlite3.Connection, group_id: str, now: str) -> None:
+def reconcile_group(
+    conn: sqlite3.Connection,
+    group_id: str,
+    now: str,
+    only_starts: Optional[set[float]] = None,
+) -> None:
     """对一个组的各 window_start 做对账。
 
     - 全部成员窗口 sealed → ready，计算 sum/avg；已 ready 且成员发生新修正时原位重算、revision+1。
     - 否则维持/落为 pending，value 始终为 NULL，绝不使用部分成员数据。
-    触发时机：成员设备 ingest 完成封存后，以及组创建后。
+
+    两种触发口径：
+    - only_starts is None（组创建后的全量初始化）：候选为任一成员出现过的、属于本组对齐
+      网格的全部 window_start，遍历历史补算 pending/ready；
+    - only_starts 为起点集合（ingest 写入路径的增量对账）：只处理本批实际新增或迟到修正
+      触及的窗口，以及水位线推进而刚封存的窗口；同组同窗天然去重（set），其余无变化的
+      历史窗口不读取、不参与本次对账。纯重复批次传入空集即完全不触碰组窗口。
     """
     group = conn.execute("SELECT * FROM device_groups WHERE group_id = ?", (group_id,)).fetchone()
     if group is None:
@@ -805,19 +821,26 @@ def reconcile_group(conn: sqlite3.Connection, group_id: str, now: str) -> None:
     members = group_member_ids(conn, group_id)
     member_n = len(members)
 
-    # 组窗口口径：任一成员出现过的、属于本组对齐网格的 window_start 都是候选。
-    # 组创建时已保证成员窗口配置一致，这里再按窗口大小过滤以排除理论上的异网格数据。
-    starts = [
-        r["window_start"]
-        for r in conn.execute(
-            f"SELECT DISTINCT w.window_start AS window_start FROM windows w"
-            f" JOIN device_group_members m ON m.device_id = w.device_id AND m.group_id = ?"
-            f" WHERE (w.window_start - CAST(w.window_start AS INTEGER)) = 0"
-            f"   AND CAST(w.window_start AS INTEGER) % ? = 0"
-            f" ORDER BY w.window_start",
-            (group_id, size),
-        ).fetchall()
-    ]
+    if only_starts is None:
+        # 组窗口口径：任一成员出现过的、属于本组对齐网格的 window_start 都是候选。
+        # 组创建时已保证成员窗口配置一致，这里再按窗口大小过滤以排除理论上的异网格数据。
+        starts = [
+            r["window_start"]
+            for r in conn.execute(
+                f"SELECT DISTINCT w.window_start AS window_start FROM windows w"
+                f" JOIN device_group_members m ON m.device_id = w.device_id AND m.group_id = ?"
+                f" WHERE (w.window_start - CAST(w.window_start AS INTEGER)) = 0"
+                f"   AND CAST(w.window_start AS INTEGER) % ? = 0"
+                f" ORDER BY w.window_start",
+                (group_id, size),
+            ).fetchall()
+        ]
+    else:
+        # 增量对账：候选起点全部来自本批变更（设备窗口配置与组一致，整数/网格过滤仅作防御）。
+        starts = sorted(
+            s for s in only_starts
+            if s == int(s) and int(s) % size == 0
+        )
 
     for w_start in starts:
         w_end = w_start + size
@@ -899,8 +922,20 @@ def reconcile_group(conn: sqlite3.Connection, group_id: str, now: str) -> None:
                 )
 
 
-def reconcile_groups_for_device(conn: sqlite3.Connection, device_id: str, now: str) -> None:
-    """成员设备 ingest 后，对其所属的全部组做对账。"""
+def reconcile_groups_for_device(
+    conn: sqlite3.Connection,
+    device_id: str,
+    now: str,
+    affected_starts: set[float],
+) -> None:
+    """成员设备 ingest 后，对其所属的全部组做**增量**对账。
+
+    只处理本批实际新增/迟到修正触及、以及因水位线推进而刚封存的窗口起点；
+    同组同窗由 set 去重只处理一次，其余历史窗口不参与。affected_starts 为空
+    （纯重复批次，无任何窗口变化）时不触碰任何组窗口。
+    """
+    if not affected_starts:
+        return
     group_ids = [
         r["group_id"]
         for r in conn.execute(
@@ -908,7 +943,7 @@ def reconcile_groups_for_device(conn: sqlite3.Connection, device_id: str, now: s
         ).fetchall()
     ]
     for group_id in group_ids:
-        reconcile_group(conn, group_id, now)
+        reconcile_group(conn, group_id, now, only_starts=affected_starts)
 
 
 def append_revision_snapshot(
@@ -1193,7 +1228,8 @@ def _run_ingest_batch(
     """在给定事务连接上按请求顺序处理整批事件（/ingest 与 /ingest/preview 共用的唯一写入口径）。
 
     逐事件推进幂等去重、窗口聚合、迟到修正、告警状态机与设备水位线，最后统一
-    封存越线窗口并对账设备所在组。返回 (逐事件结果, 处理后水位线, 本批次触及窗口起点集合)。
+    封存越线窗口并增量对账设备所在组（只对账本批触及窗口与刚封存窗口，纯重复批次
+    不触碰组窗口）。返回 (逐事件结果, 处理后水位线, 本批次触及窗口起点集合)。
     "触及窗口"指至少有一个非重复事件落入的窗口；预演接口据此回读预演后的窗口状态。
     """
     results: list[EventResult] = []
@@ -1274,14 +1310,31 @@ def _run_ingest_batch(
         "UPDATE devices SET watermark = ? WHERE device_id = ?",
         (watermark, req.device_id),
     )
+
+    # 增量对账的窗口起点 = 本批非重复事件触及（新增/迟到修正）的窗口
+    # ∪ 因水位线推进而**刚封存**的窗口。刚封存集合必须在封存 UPDATE 前确定：
+    # 只取当前仍 open、封存后即转 sealed 的起点（已封存的旧窗口不会重复对账）。
+    # 纯重复批次两集合皆空，组窗口完全不被触碰。
+    affected_starts: set[float] = set(touched_starts)
+    if watermark is not None:
+        affected_starts.update(
+            r["window_start"]
+            for r in conn.execute(
+                "SELECT window_start FROM windows"
+                " WHERE device_id = ? AND status = 'open' AND window_end + ? <= ?",
+                (req.device_id, lateness, watermark),
+            ).fetchall()
+        )
+
     conn.execute(
         "UPDATE windows SET status = 'sealed', sealed_at = ?"
         " WHERE device_id = ? AND status = 'open' AND window_end + ? <= ?",
         (now, req.device_id, lateness, watermark),
     )
 
-    # 窗口封存 / 迟到修正后，同步重算该设备所在组的同步窗口汇总
-    reconcile_groups_for_device(conn, req.device_id, now)
+    # 窗口封存 / 迟到修正后，仅对本批实际发生变化的窗口增量重算该设备所在组的汇总；
+    # 无变化的历史窗口不参与本次写入对账（组创建时的全量初始化仍遍历全部历史窗口）。
+    reconcile_groups_for_device(conn, req.device_id, now, affected_starts)
 
     return results, watermark, touched_starts
 

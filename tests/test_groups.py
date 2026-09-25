@@ -250,3 +250,53 @@ def test_group_requires_matching_window_config(client):
     assert r.status_code == 409
     r = make_group(client, members=("d1", "d2"), window_size=300)
     assert r.status_code == 409
+
+
+def test_ingest_reconciles_only_affected_group_windows(client):
+    """写入路径只对账本批触及/刚封存窗口：历史组窗口不变，纯重复批次零组窗口变更。"""
+    from datetime import datetime, timezone
+    from app import db
+    from app.main import to_epoch
+
+    def ws_at(minute: int) -> float:
+        return to_epoch(datetime(2026, 9, 22, 0, minute, 0, tzinfo=timezone.utc))
+
+    ingest(client, "d1", [{"event_id": "e0", "event_time": "2026-09-22T00:00:10Z", "value": 1.0}])
+    ingest(client, "d2", [{"event_id": "e0", "event_time": "2026-09-22T00:00:20Z", "value": 2.0}])
+    assert make_group(client).status_code == 201
+
+    # 造出一批已 ready 的历史组窗口：每分钟一个事件，下一分钟的事件封存前一分钟窗口
+    N = 30
+    for k in range(1, N + 1):
+        at = f"2026-09-22T00:{k:02d}:10Z"
+        ingest(client, "d1", [{"event_id": f"a{k}", "event_time": at, "value": 1.0}])
+        ingest(client, "d2", [{"event_id": f"a{k}", "event_time": at, "value": 1.0}])
+
+    def snapshot_group_windows():
+        with db.session() as conn:
+            return {
+                r["window_start"]: (
+                    r["status"], r["value"], r["sealed_member_count"], r["revision"],
+                    r["correction_sig"], r["ready_at"], r["updated_at"],
+                )
+                for r in conn.execute(
+                    "SELECT * FROM group_windows ORDER BY window_start"
+                ).fetchall()
+            }
+
+    before = snapshot_group_windows()
+
+    # 一个落在新窗口（分钟 N+2）的事件：只应新增/改动该窗口及本次刚封存窗口的组汇总，
+    # 已 ready 的历史窗口逐行保持不变（不被重扫重算）。
+    ingest(client, "d1", [{"event_id": "new", "event_time": f"2026-09-22T00:{N+2:02d}:10Z", "value": 7.0}])
+    after = snapshot_group_windows()
+
+    # 分钟 N+2:10（水位线）+ lateness=30 只能封存到分钟 N；分钟 N-2 及更早在此之前
+    # 早已封存/ready，本次增量对账不应触碰它们（分钟 N-1、N 是本次刚封存的窗口，允许变化）。
+    for ws in [ws_at(k) for k in range(0, N - 1)]:
+        assert after.get(ws) == before.get(ws), f"historical group window {ws} changed during reconcile"
+
+    # 纯重复批次：幂等去重，不推进水位线，组窗口逐行完全不变
+    r = ingest(client, "d1", [{"event_id": "new", "event_time": f"2026-09-22T00:{N+2:02d}:10Z", "value": 7.0}])
+    assert (r.json()["duplicates"], r.json()["accepted"], r.json()["late"]) == (1, 0, 0)
+    assert snapshot_group_windows() == after

@@ -39,6 +39,9 @@
 - 成员窗口因迟到事件发生修正后，已生成的组汇总原位重算且 revision 加一；
 - 修正以成员窗口 correction_count 之和为签名：同一 event_id 重试是幂等去重，
   不会产生新修正，签名不变，revision 不重复升版。
+- 写入路径按**增量**对账：仅对本批实际新增/迟到修正的窗口、以及因水位线推进
+  而刚封存的窗口做组对账，同组同窗只处理一次，其余无变化的历史窗口不参与本次
+  写入对账（纯重复批次不触发任何组窗口变更）；只有组创建时做一次全量初始化。
 
 组窗口修订审计（append-only 快照）：
 - 组窗口首次 ready、以及迟到修正令 revision 升版时，在**同一事务**追加一份不可变快照，
@@ -789,12 +792,119 @@ def group_member_ids(conn: sqlite3.Connection, group_id: str) -> list[str]:
     return [r["device_id"] for r in rows]
 
 
-def reconcile_group(conn: sqlite3.Connection, group_id: str, now: str) -> None:
-    """对一个组的各 window_start 做对账。
+def _reconcile_group_window(
+    conn: sqlite3.Connection,
+    group_id: str,
+    w_start: float,
+    size: int,
+    aggregation: str,
+    members: list[str],
+    member_n: int,
+    now: str,
+) -> None:
+    """对账单个组窗口（同一 window_start）。
 
     - 全部成员窗口 sealed → ready，计算 sum/avg；已 ready 且成员发生新修正时原位重算、revision+1。
     - 否则维持/落为 pending，value 始终为 NULL，绝不使用部分成员数据。
-    触发时机：成员设备 ingest 完成封存后，以及组创建后。
+    """
+    w_end = w_start + size
+    win_rows = {
+        r["device_id"]: r
+        for r in conn.execute(
+            f"SELECT w.* FROM windows w"
+            f" JOIN device_group_members m ON m.device_id = w.device_id AND m.group_id = ?"
+            f" WHERE w.window_start = ? ORDER BY m.position",
+            (group_id, w_start),
+        ).fetchall()
+    }
+    sealed = [win_rows[d] for d in members if d in win_rows and win_rows[d]["status"] == "sealed"]
+    sealed_n = len(sealed)
+    all_sealed = sealed_n == member_n
+    correction_sig = sum(r["correction_count"] for r in sealed)
+
+    existing = conn.execute(
+        "SELECT * FROM group_windows WHERE group_id = ? AND window_start = ?",
+        (group_id, w_start),
+    ).fetchone()
+
+    if all_sealed:
+        if aggregation == "sum":
+            value = sum(r["sum"] for r in sealed)
+        else:
+            # avg：各成员窗口平均值的算术平均（每个固定成员权重相同）
+            value = sum(r["sum"] / r["count"] for r in sealed if r["count"] > 0) / member_n
+
+        if existing is None:
+            conn.execute(
+                "INSERT INTO group_windows (group_id, window_start, window_end, status, value,"
+                " member_count, sealed_member_count, revision, correction_sig, ready_at,"
+                " created_at, updated_at)"
+                " VALUES (?, ?, ?, 'ready', ?, ?, ?, 1, ?, ?, ?, ?)",
+                (group_id, w_start, w_end, value, member_n, member_n, correction_sig, now, now, now),
+            )
+            # 首次 ready：同一事务追加 revision=1 的不可变快照
+            append_revision_snapshot(conn, group_id, w_start, 1, value, members, win_rows, now)
+        elif existing["status"] == "ready":
+            # 已生成的组汇总原位重算：仅当成员窗口出现新的迟到修正（签名推进）时升版。
+            # 同一 event_id 重试在 ingest 侧幂等去重，correction_count 不变，故不重复升版。
+            if correction_sig > existing["correction_sig"]:
+                new_revision = existing["revision"] + 1
+                conn.execute(
+                    "UPDATE group_windows SET status = 'ready', value = ?, sealed_member_count = ?,"
+                    " revision = revision + 1, correction_sig = ?, updated_at = ?"
+                    " WHERE group_id = ? AND window_start = ?",
+                    (value, member_n, correction_sig, now, group_id, w_start),
+                )
+                # revision 升版：同一事务追加新快照；旧快照不动、绝不覆盖
+                append_revision_snapshot(
+                    conn, group_id, w_start, new_revision, value, members, win_rows, now
+                )
+        else:
+            # pending → ready（迟到修正发生在 ready 之前，已包含在首次结果里，revision 从 1 起）
+            conn.execute(
+                "UPDATE group_windows SET status = 'ready', value = ?, sealed_member_count = ?,"
+                " revision = 1, correction_sig = ?, ready_at = ?, updated_at = ?"
+                " WHERE group_id = ? AND window_start = ?",
+                (value, member_n, correction_sig, now, now, group_id, w_start),
+            )
+            # pending → ready 的首次 ready：同一事务追加 revision=1 快照
+            append_revision_snapshot(conn, group_id, w_start, 1, value, members, win_rows, now)
+    else:
+        if existing is None:
+            conn.execute(
+                "INSERT INTO group_windows (group_id, window_start, window_end, status, value,"
+                " member_count, sealed_member_count, revision, correction_sig, ready_at,"
+                " created_at, updated_at)"
+                " VALUES (?, ?, ?, 'pending', NULL, ?, ?, 0, 0, NULL, ?, ?)",
+                (group_id, w_start, w_end, member_n, sealed_n, now, now),
+            )
+        elif existing["status"] == "pending" and existing["sealed_member_count"] != sealed_n:
+            conn.execute(
+                "UPDATE group_windows SET sealed_member_count = ?, updated_at = ?"
+                " WHERE group_id = ? AND window_start = ?",
+                (sealed_n, now, group_id, w_start),
+            )
+
+
+def reconcile_group(
+    conn: sqlite3.Connection,
+    group_id: str,
+    now: str,
+    starts: Optional[set[float]] = None,
+) -> None:
+    """对一个组的各 window_start 做对账。
+
+    两种口径：
+    - starts=None（全量）：遍历组内任一成员出现过的、属于本组对齐网格的全部
+      window_start。仅用于**组创建时的全量初始化**（成员可能已有任意历史窗口）。
+    - starts=<起点集合>（增量）：只对账给定窗口起点，用于成员设备 ingest 后。
+      集合由"本批实际新增/迟到修正的窗口"与"本批因水位线推进而刚封存的窗口"
+      决定；同组同窗只处理一次，其余无变化的历史窗口不参与本次写入对账，
+      历史数据增长后也不会反复读取旧窗口。
+
+    单个窗口的对账规则见 _reconcile_group_window：全部成员窗口 sealed → ready，
+    已 ready 且成员发生新修正时原位重算、revision+1；否则维持/落为 pending，
+    value 始终为 NULL，绝不使用部分成员数据。
     """
     group = conn.execute("SELECT * FROM device_groups WHERE group_id = ?", (group_id,)).fetchone()
     if group is None:
@@ -805,102 +915,47 @@ def reconcile_group(conn: sqlite3.Connection, group_id: str, now: str) -> None:
     members = group_member_ids(conn, group_id)
     member_n = len(members)
 
-    # 组窗口口径：任一成员出现过的、属于本组对齐网格的 window_start 都是候选。
-    # 组创建时已保证成员窗口配置一致，这里再按窗口大小过滤以排除理论上的异网格数据。
-    starts = [
-        r["window_start"]
-        for r in conn.execute(
-            f"SELECT DISTINCT w.window_start AS window_start FROM windows w"
-            f" JOIN device_group_members m ON m.device_id = w.device_id AND m.group_id = ?"
-            f" WHERE (w.window_start - CAST(w.window_start AS INTEGER)) = 0"
-            f"   AND CAST(w.window_start AS INTEGER) % ? = 0"
-            f" ORDER BY w.window_start",
-            (group_id, size),
-        ).fetchall()
-    ]
-
-    for w_start in starts:
-        w_end = w_start + size
-        win_rows = {
-            r["device_id"]: r
+    if starts is None:
+        # 组窗口口径：任一成员出现过的、属于本组对齐网格的 window_start 都是候选。
+        # 组创建时已保证成员窗口配置一致，这里再按窗口大小过滤以排除理论上的异网格数据。
+        candidate_starts = [
+            r["window_start"]
             for r in conn.execute(
-                f"SELECT w.* FROM windows w"
+                f"SELECT DISTINCT w.window_start AS window_start FROM windows w"
                 f" JOIN device_group_members m ON m.device_id = w.device_id AND m.group_id = ?"
-                f" WHERE w.window_start = ? ORDER BY m.position",
-                (group_id, w_start),
+                f" WHERE (w.window_start - CAST(w.window_start AS INTEGER)) = 0"
+                f"   AND CAST(w.window_start AS INTEGER) % ? = 0"
+                f" ORDER BY w.window_start",
+                (group_id, size),
             ).fetchall()
-        }
-        sealed = [win_rows[d] for d in members if d in win_rows and win_rows[d]["status"] == "sealed"]
-        sealed_n = len(sealed)
-        all_sealed = sealed_n == member_n
-        correction_sig = sum(r["correction_count"] for r in sealed)
+        ]
+    else:
+        # 增量口径：起点来自本设备本批触及/刚封存的窗口。成员窗口配置在组创建时已校验
+        # 与本组一致（窗口大小有数据后不可改），这里仍按网格做防御性过滤。
+        candidate_starts = sorted(
+            s
+            for s in starts
+            if (s - int(s)) == 0 and int(s) % size == 0
+        )
 
-        existing = conn.execute(
-            "SELECT * FROM group_windows WHERE group_id = ? AND window_start = ?",
-            (group_id, w_start),
-        ).fetchone()
-
-        if all_sealed:
-            if aggregation == "sum":
-                value = sum(r["sum"] for r in sealed)
-            else:
-                # avg：各成员窗口平均值的算术平均（每个固定成员权重相同）
-                value = sum(r["sum"] / r["count"] for r in sealed if r["count"] > 0) / member_n
-
-            if existing is None:
-                conn.execute(
-                    "INSERT INTO group_windows (group_id, window_start, window_end, status, value,"
-                    " member_count, sealed_member_count, revision, correction_sig, ready_at,"
-                    " created_at, updated_at)"
-                    " VALUES (?, ?, ?, 'ready', ?, ?, ?, 1, ?, ?, ?, ?)",
-                    (group_id, w_start, w_end, value, member_n, member_n, correction_sig, now, now, now),
-                )
-                # 首次 ready：同一事务追加 revision=1 的不可变快照
-                append_revision_snapshot(conn, group_id, w_start, 1, value, members, win_rows, now)
-            elif existing["status"] == "ready":
-                # 已生成的组汇总原位重算：仅当成员窗口出现新的迟到修正（签名推进）时升版。
-                # 同一 event_id 重试在 ingest 侧幂等去重，correction_count 不变，故不重复升版。
-                if correction_sig > existing["correction_sig"]:
-                    new_revision = existing["revision"] + 1
-                    conn.execute(
-                        "UPDATE group_windows SET status = 'ready', value = ?, sealed_member_count = ?,"
-                        " revision = revision + 1, correction_sig = ?, updated_at = ?"
-                        " WHERE group_id = ? AND window_start = ?",
-                        (value, member_n, correction_sig, now, group_id, w_start),
-                    )
-                    # revision 升版：同一事务追加新快照；旧快照不动、绝不覆盖
-                    append_revision_snapshot(
-                        conn, group_id, w_start, new_revision, value, members, win_rows, now
-                    )
-            else:
-                # pending → ready（迟到修正发生在 ready 之前，已包含在首次结果里，revision 从 1 起）
-                conn.execute(
-                    "UPDATE group_windows SET status = 'ready', value = ?, sealed_member_count = ?,"
-                    " revision = 1, correction_sig = ?, ready_at = ?, updated_at = ?"
-                    " WHERE group_id = ? AND window_start = ?",
-                    (value, member_n, correction_sig, now, now, group_id, w_start),
-                )
-                # pending → ready 的首次 ready：同一事务追加 revision=1 快照
-                append_revision_snapshot(conn, group_id, w_start, 1, value, members, win_rows, now)
-        else:
-            if existing is None:
-                conn.execute(
-                    "INSERT INTO group_windows (group_id, window_start, window_end, status, value,"
-                    " member_count, sealed_member_count, revision, correction_sig, ready_at,"
-                    " created_at, updated_at)"
-                    " VALUES (?, ?, ?, 'pending', NULL, ?, ?, 0, 0, NULL, ?, ?)",
-                    (group_id, w_start, w_end, member_n, sealed_n, now, now),
-                )
-            elif existing["status"] == "pending" and existing["sealed_member_count"] != sealed_n:
-                conn.execute(
-                    "UPDATE group_windows SET sealed_member_count = ?, updated_at = ?"
-                    " WHERE group_id = ? AND window_start = ?",
-                    (sealed_n, now, group_id, w_start),
-                )
+    for w_start in candidate_starts:
+        _reconcile_group_window(
+            conn, group_id, w_start, size, aggregation, members, member_n, now
+        )
 
 
-def reconcile_groups_for_device(conn: sqlite3.Connection, device_id: str, now: str) -> None:
-    """成员设备 ingest 后，对其所属的全部组做对账。"""
+def reconcile_groups_for_device(
+    conn: sqlite3.Connection,
+    device_id: str,
+    now: str,
+    affected_starts: Optional[set[float]] = None,
+) -> None:
+    """成员设备 ingest 后，对其所属的全部组做增量对账。
+
+    affected_starts 为本批实际写入/迟到修正、以及因水位线推进而刚封存的窗口起点；
+    各组只对账这些窗口（同组同窗一次），不重扫历史窗口。组创建时的全量初始化
+    另走 reconcile_group(starts=None)。
+    """
     group_ids = [
         r["group_id"]
         for r in conn.execute(
@@ -908,7 +963,7 @@ def reconcile_groups_for_device(conn: sqlite3.Connection, device_id: str, now: s
         ).fetchall()
     ]
     for group_id in group_ids:
-        reconcile_group(conn, group_id, now)
+        reconcile_group(conn, group_id, now, starts=affected_starts)
 
 
 def append_revision_snapshot(
@@ -1269,7 +1324,21 @@ def _run_ingest_batch(
             watermark = t
         results.append(EventResult(event_id=ev.event_id, status=status, window_start=to_iso(w_start)))
 
-    # 持久化水位线，并封存所有越过允许迟到窗口的窗口
+    # 持久化水位线。封存前先取出"本批因水位线推进而刚封存"的 open 窗口：
+    # 水位线只可能随非重复事件前进，重复批次水位线不变、该集合为空。
+    # 这些窗口（连同上面 touched_starts 里本批实际新增/迟到修正的窗口）即组对账
+    # 所需的全部起点——成员窗口状态只可能在这两种情况下变化，其余历史窗口无需重读。
+    newly_sealed_starts: set[float] = set()
+    if watermark is not None:
+        newly_sealed_starts = {
+            r["window_start"]
+            for r in conn.execute(
+                "SELECT window_start FROM windows"
+                " WHERE device_id = ? AND status = 'open' AND window_end + ? <= ?",
+                (req.device_id, lateness, watermark),
+            ).fetchall()
+        }
+
     conn.execute(
         "UPDATE devices SET watermark = ? WHERE device_id = ?",
         (watermark, req.device_id),
@@ -1280,8 +1349,10 @@ def _run_ingest_batch(
         (now, req.device_id, lateness, watermark),
     )
 
-    # 窗口封存 / 迟到修正后，同步重算该设备所在组的同步窗口汇总
-    reconcile_groups_for_device(conn, req.device_id, now)
+    # 窗口封存 / 迟到修正后，增量同步该设备所在组的同步窗口汇总：
+    # 只对账本批触及窗口与刚封存窗口（同组同窗一次），不遍历成员全部历史窗口。
+    affected_starts = touched_starts | newly_sealed_starts
+    reconcile_groups_for_device(conn, req.device_id, now, affected_starts=affected_starts)
 
     return results, watermark, touched_starts
 
